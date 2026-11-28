@@ -1,41 +1,21 @@
-From b67fc247a9e4cbba58f3bd237dc5a0b45cd5962f Mon Sep 17 00:00:00 2001
+From 3b714c8861d30271c2b7fe986627d2e3fbde7b20 Mon Sep 17 00:00:00 2001
 From: Steambot12 <wilfridus.it@gmail.com>
-Date: Thu, 26 Nov 2026 11:42:39 +0000
+Date: Sat, 28 Nov 2026 07:13:11 +0000
 Subject: [PATCH] cpuidle: aegis: update to v0.2
 
-Upgrade the Adaptive Energy-Gated Idle Subsystem (AEGIS) cpuidle governor
-to v0.2. This revision eliminates idle sleep lockouts, prevents shallow
-WFI/tick trapping, and ensures deterministic deep C-state entry:
+Prevent erratic IRQ bursts from permanently trapping CPUs in shallow states while ensuring clean deep cluster sleep across standby and steady media playback:
 
-1. Bounded Pay and Break-Even Debt Ceiling:
-   - Bound maximum pay in aegis_select() to 1.5x target residency (and
-     1.0x target residency under standby deep affinity), preventing
-     unbounded inflation while never dipping below hardware break-even
-     residency.
-   - Cap accumulated debt ceiling in aegis_reflect() at 1.5x target
-     residency (floored at 1.0x target residency) so interrupt bursts
-     cannot lock out deep sleep.
-
-2. Tick Stop Contract Safety:
-   - Keep the scheduler tick stopped across long sleep windows and when
-     tick_nohz_tick_stopped() is already true. Only leave the tick active
-     (*stop_tick = false) and clamp delta_tick when polling or when the
-     expected sleep window is shorter than one tick with an active tick.
-
-3. State 0 Anti-Trap and Standby Deep Affinity:
-   - Trim State 1 debt and boost calmness when WFI residency outlives half
-     of State 1's target residency.
-   - Accelerate quiet penalty recovery to 100ms and calibrate
-     AEGIS_LONG_SLEEP_NS to 25ms so standby wakeups re-enter deep sleep
-     promptly without false-triggering on active UI frame pauses.
+- Bound residency pay to 1.0x-1.5x of target residency (and lock cleanly to 1.0x under deep affinity without wasted debt math) so bursts remain damped without indefinite sleep lockouts.
+- Keep the scheduler tick stopped across deep and long sleeps, clearing it only when polling or when expected sleep falls under one tick while active.
+- Trim shallow-trap debt via State-0 residency feedback, tune recovery to 100 ms and deep affinity to 25 ms, and arm recovery timestamps on non-catastrophic misses so elevated debt always decays cleanly.
 
 Signed-off-by: Steambot12 <wilfridus.it@gmail.com>
 ---
- drivers/cpuidle/governors/aegis.c | 233 ++++++++----------------------
- 1 file changed, 60 insertions(+), 173 deletions(-)
+ drivers/cpuidle/governors/aegis.c | 238 ++++++++----------------------
+ 1 file changed, 64 insertions(+), 174 deletions(-)
 
 diff --git a/drivers/cpuidle/governors/aegis.c b/drivers/cpuidle/governors/aegis.c
-index b058b5cd1b0e9..68e0f67403051 100644
+index b058b5cd1b0e9..b10da900a2f95 100644
 --- a/drivers/cpuidle/governors/aegis.c
 +++ b/drivers/cpuidle/governors/aegis.c
 @@ -1,24 +1,10 @@
@@ -214,20 +194,23 @@ index b058b5cd1b0e9..68e0f67403051 100644
  	for (i = min_t(int, drv->state_count - 1, CPUIDLE_STATE_MAX - 1); i >= 1; i--) {
  		const struct cpuidle_state *st = &drv->states[i];
  
-@@ -233,6 +175,12 @@ static int aegis_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+@@ -232,7 +174,14 @@ static int aegis_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+ 		if (st->exit_latency_ns > (u64)latency_req)
  			continue;
  
- 		pay = ((s64)d->debt[i] * charge_scale) >> AEGIS_SHIFT;
-+		if (in_deep_affinity)
+-		pay = ((s64)d->debt[i] * charge_scale) >> AEGIS_SHIFT;
++		if (in_deep_affinity) {
 +			pay = (s64)st->target_residency_ns;
-+		else
++		} else {
++			pay = ((s64)d->debt[i] * charge_scale) >> AEGIS_SHIFT;
 +			pay = clamp_t(s64, pay, (s64)st->target_residency_ns,
 +				      (s64)st->target_residency_ns * 3 / 2);
++		}
 +
  		if ((s64)window_ns < pay)
  			continue;
  
-@@ -240,49 +188,34 @@ static int aegis_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+@@ -240,49 +189,34 @@ static int aegis_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
  		break;
  	}
  
@@ -298,7 +281,7 @@ index b058b5cd1b0e9..68e0f67403051 100644
  		d->stats.deep_entries++;
  
  	d->stats.selects++;
-@@ -306,32 +239,19 @@ static void aegis_reflect(struct cpuidle_device *dev, int index)
+@@ -306,32 +240,19 @@ static void aegis_reflect(struct cpuidle_device *dev, int index)
  	d->last_wake_ns = now_ns;
  	d->stats.residency_ns += measured;
  
@@ -336,7 +319,7 @@ index b058b5cd1b0e9..68e0f67403051 100644
  		}
  		return;
  	}
-@@ -340,48 +260,27 @@ static void aegis_reflect(struct cpuidle_device *dev, int index)
+@@ -340,48 +261,29 @@ static void aegis_reflect(struct cpuidle_device *dev, int index)
  		return;
  
  	debt = d->debt[index];
@@ -389,10 +372,12 @@ index b058b5cd1b0e9..68e0f67403051 100644
  		next = debt + (debt >> AEGIS_DEBT_GROW_SHIFT);
 -		d->debt[index] = aegis_min_s64(next, hi);
 +		d->debt[index] = min_t(s64, next, hi);
++		if (d->debt[index] > lo && !d->last_miss_ns)
++			d->last_miss_ns = now_ns;
  		d->stats.misses++;
  	}
  }
-@@ -441,7 +340,6 @@ static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
+@@ -441,7 +343,6 @@ static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
  	return len;
  }
  
@@ -400,7 +385,7 @@ index b058b5cd1b0e9..68e0f67403051 100644
  static ssize_t calm_show(struct kobject *kobj, struct kobj_attribute *attr,
  			 char *buf)
  {
-@@ -456,7 +354,6 @@ static ssize_t calm_show(struct kobject *kobj, struct kobj_attribute *attr,
+@@ -456,7 +357,6 @@ static ssize_t calm_show(struct kobject *kobj, struct kobj_attribute *attr,
  			  (unsigned int)((u64)d->calm * 1000 >> AEGIS_SHIFT));
  }
  
@@ -408,7 +393,7 @@ index b058b5cd1b0e9..68e0f67403051 100644
  static ssize_t debt_show(struct kobject *kobj, struct kobj_attribute *attr,
  			 char *buf)
  {
-@@ -497,11 +394,6 @@ static ssize_t headroom_show(struct kobject *kobj,
+@@ -497,11 +397,6 @@ static ssize_t headroom_show(struct kobject *kobj,
  			  per_cpu_ptr(&aegis_data, cpu)->headroom_millths);
  }
  
@@ -420,7 +405,7 @@ index b058b5cd1b0e9..68e0f67403051 100644
  static ssize_t headroom_store(struct kobject *kobj,
  			      struct kobj_attribute *attr,
  			      const char *buf, size_t count)
-@@ -518,10 +410,6 @@ static ssize_t headroom_store(struct kobject *kobj,
+@@ -518,10 +413,6 @@ static ssize_t headroom_store(struct kobject *kobj,
  	return count;
  }
  
@@ -431,7 +416,7 @@ index b058b5cd1b0e9..68e0f67403051 100644
  static ssize_t reset_store(struct kobject *kobj, struct kobj_attribute *attr,
  			   const char *buf, size_t count)
  {
-@@ -572,7 +460,6 @@ static int __init aegis_init(void)
+@@ -572,7 +463,6 @@ static int __init aegis_init(void)
  	if (ret)
  		return ret;
  

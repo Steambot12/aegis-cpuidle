@@ -174,12 +174,13 @@ static int aegis_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		if (st->exit_latency_ns > (u64)latency_req)
 			continue;
 
-		pay = ((s64)d->debt[i] * charge_scale) >> AEGIS_SHIFT;
-		if (in_deep_affinity)
+		if (in_deep_affinity) {
 			pay = (s64)st->target_residency_ns;
-		else
+		} else {
+			pay = ((s64)d->debt[i] * charge_scale) >> AEGIS_SHIFT;
 			pay = clamp_t(s64, pay, (s64)st->target_residency_ns,
 				      (s64)st->target_residency_ns * 3 / 2);
+		}
 
 		if ((s64)window_ns < pay)
 			continue;
@@ -281,6 +282,8 @@ static void aegis_reflect(struct cpuidle_device *dev, int index)
 	} else {
 		next = debt + (debt >> AEGIS_DEBT_GROW_SHIFT);
 		d->debt[index] = min_t(s64, next, hi);
+		if (d->debt[index] > lo && !d->last_miss_ns)
+			d->last_miss_ns = now_ns;
 		d->stats.misses++;
 	}
 }
